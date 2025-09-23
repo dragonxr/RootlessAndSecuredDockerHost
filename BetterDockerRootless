@@ -1,0 +1,724 @@
+#!/bin/bash
+
+## written by a tired Engineer at God knows when in the morning,
+## now with less root and more paranoia, coming to a console near you.
+## Works for me, but might not have been checked with enough caffeine.
+
+set -euo pipefail
+
+LOGFILE="/var/log/docker-hardening.log"
+DOCKER_USER="dockeruser"
+
+REQUIRED_PACKAGES=(
+ca-certificates
+curl
+gnupg
+lsb-release
+apparmor
+auditd
+fail2ban
+uidmap
+iptables
+logrotate
+iptables-persistent
+netfilter-persistent
+slirp4netns
+fuse-overlayfs
+dbus-user-session
+openssl
+jq
+"linux-headers-$(uname -r)"
+)
+
+DOCKER_PACKAGES=(
+docker-ce
+docker-ce-cli
+containerd.io
+docker-buildx-plugin
+docker-ce-rootless-extras
+)
+
+# --- Utility: timestamped logger ---
+log() {
+  echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
+}
+
+# --- Pre-flight: must be root ---
+ensure_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    log "You need root for this. Maybe try 'sudo'."
+    exit 1
+  fi
+}
+
+# --- Retry apt operations to avoid lock contention ---
+apt_retry() {
+  local cmd="$*"
+  local attempts=5
+  until $cmd; do
+    ((attempts--)) || {
+      log "APT failed after retries: $cmd"
+      exit 1
+    }
+    log "APT busy, retrying in 5s"
+    sleep 5
+  done
+}
+
+# --- Install system deps if missing ---
+install_packages() {
+  log "---- Updating APT and installing system dependencies"
+  apt_retry apt update
+
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+      log "Installing: $pkg"
+      apt_retry apt install -y "$pkg"
+    fi
+  done
+
+  for pkg in "${DOCKER_PACKAGES[@]}"; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+      log "Installing Docker package: $pkg"
+      apt_retry apt install -y "$pkg"
+    fi
+  done
+}
+
+# --- Add Docker APT repository ---
+add_docker_repo() {
+  log "---- Checking Docker APT repo; adding if missing"
+
+  local keyring="/usr/share/keyrings/docker-archive-keyring.gpg"
+  local repo_file="/etc/apt/sources.list.d/docker.list"
+
+  if ! grep -q "download.docker.com" "$repo_file" 2>/dev/null; then
+    log "Downloading and installing Docker GPG key"
+    curl -fsSL https://download.docker.com/linux/debian/gpg | \
+      tee "$keyring" > /dev/null
+
+    chmod 644 "$keyring"
+
+    log "Adding Docker APT repository"
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] \
+https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+      | tee "$repo_file" > /dev/null
+
+    apt_retry apt update
+  else
+    log "Docker APT repository already present"
+  fi
+}
+
+# --- Verify essential binaries exist ---
+validate_dependencies() {
+  log "---- Validating essential Docker tools presence"
+  command -v dockerd-rootless-setuptool.sh &>/dev/null \
+    || { log "Missing dockerd-rootless-setuptool.sh"; exit 1; }
+  command -v docker &>/dev/null \
+    || { log "Missing docker CLI"; exit 1; }
+}
+
+# --- Create and configure non-root Docker user ---
+create_user() {
+  if ! id "$DOCKER_USER" &>/dev/null; then
+    log "---- Creating non-root user: $DOCKER_USER"
+    adduser --disabled-password --gecos "" "$DOCKER_USER"
+  fi
+
+  log "---- Ensuring subuid/subgid mappings"
+  grep -q "^${DOCKER_USER}:" /etc/subuid \
+    || echo "${DOCKER_USER}:100000:65536" >> /etc/subuid
+  grep -q "^${DOCKER_USER}:" /etc/subgid \
+    || echo "${DOCKER_USER}:100000:65536" >> /etc/subgid
+  chmod 644 /etc/subuid /etc/subgid
+
+  log "---- Adding $DOCKER_USER to docker group"
+  usermod -aG docker "$DOCKER_USER"
+
+  log "---- Ensuring home ownership"
+  chown -R "$DOCKER_USER":"$DOCKER_USER" "/home/$DOCKER_USER"
+  log "---- Ensuring home ownership done"
+}
+
+# --- Enable systemd lingering for rootless services ---
+enable_lingering() {
+  if ! command -v loginctl &>/dev/null; then
+    log "loginctl not found; lingering not enabled"
+    return 1
+  fi
+
+  if ! id "$DOCKER_USER" &>/dev/null; then
+    log "User $DOCKER_USER does not exist; cannot enable lingering"
+    return 1
+  fi
+
+  # Try to get lingering status, suppress error messages
+  local linger
+  if ! linger=$(loginctl show-user "$DOCKER_USER" -p Linger --value 2>/dev/null); then
+    log "User $DOCKER_USER has no session or lingering info, attempting to enable lingering..."
+    if loginctl enable-linger "$DOCKER_USER"; then
+      log "---- Lingering enabled for $DOCKER_USER"
+    else
+      log "Failed to enable lingering for $DOCKER_USER"
+      return 1
+    fi
+    return 0
+  fi
+
+  if [[ "$linger" != "yes" ]]; then
+    log "Lingering disabled for $DOCKER_USER; enabling now..."
+    if loginctl enable-linger "$DOCKER_USER"; then
+      log "---- Lingering enabled for $DOCKER_USER"
+    else
+      log "Failed to enable lingering for $DOCKER_USER"
+      return 1
+    fi
+  else
+    log "---- Lingering already enabled for $DOCKER_USER"
+  fi
+}
+
+
+# --- Set up rootless Docker daemon ---
+setup_rootless() {
+  log "---- Ensuring rootful Docker service and socket are stopped and disabled"
+  if systemctl is-active --quiet docker.service; then
+    log "Stopping docker.service"
+    sudo systemctl stop docker.service
+  fi
+  if systemctl is-enabled --quiet docker.service; then
+    log "Disabling docker.service"
+    sudo systemctl disable docker.service
+  fi
+  if systemctl is-active --quiet docker.socket; then
+    log "Stopping docker.socket"
+    sudo systemctl stop docker.socket
+  fi
+  if systemctl is-enabled --quiet docker.socket; then
+    log "Disabling docker.socket"
+    sudo systemctl disable docker.socket
+  fi
+  systemctl mask docker.socket || log "Couldn't mask docker.socket"
+  if [ -S /var/run/docker.sock ]; then
+    log "Removing stale /var/run/docker.sock"
+    sudo rm -f /var/run/docker.sock
+  fi
+  log "---- Setting up rootless Docker"
+  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" \
+    dockerd-rootless-setuptool.sh install
+  # Use explicit XDG_RUNTIME_DIR for systemctl --user calls
+  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" \
+    systemctl --user enable docker
+  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" \
+    systemctl --user start docker
+}
+
+
+wait_for_docker() {
+  log "---- Waiting for rootless Docker to come online"
+  local timeout=30
+  until sudo -u "$DOCKER_USER" docker info &>/dev/null; do
+    ((--timeout)) || {
+      log "Docker did not start in time; check logs"
+      exit 1
+    }
+    sleep 3
+  done
+  log "Docker is online"
+}
+
+
+# --- Write user-level daemon.json with remap, logging, seccomp ---
+configure_user_daemon() {
+  log "---- Writing user-level Docker daemon config and hardened seccomp profile"
+
+  local cfg_dir="/home/$DOCKER_USER/.config/docker"
+  local sec_profile="$cfg_dir/seccomp.json"
+  local daemon_config="$cfg_dir/daemon.json"
+
+  # Create config directory
+  sudo -u "$DOCKER_USER" mkdir -p "$cfg_dir"
+
+  # Write the hardened seccomp profile (literal heredoc to prevent variable expansion)
+  sudo -u "$DOCKER_USER" tee "$sec_profile" >/dev/null <<'EOF'
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_X32"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept",
+        "accept4",
+        "access",
+        "alarm",
+        "arch_prctl",
+        "bind",
+        "brk",
+        "capget",
+        "capset",
+        "chdir",
+        "chmod",
+        "chown",
+        "clock_gettime",
+        "clone",
+        "close",
+        "connect",
+        "creat",
+        "dup",
+        "dup2",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "epoll_wait",
+        "eventfd2",
+        "execve",
+        "exit",
+        "exit_group",
+        "faccessat",
+        "fadvise64",
+        "fallocate",
+        "fanotify_mark",
+        "fchdir",
+        "fchmod",
+        "fchmodat",
+        "fchown",
+        "fchownat",
+        "fcntl",
+        "fdatasync",
+        "fstat",
+        "fstatfs",
+        "fsync",
+        "ftruncate",
+        "futex",
+        "getcwd",
+        "getdents",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getpid",
+        "getppid",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getrusage",
+        "getuid",
+        "inotify_add_watch",
+        "inotify_init1",
+        "inotify_rm_watch",
+        "ioctl",
+        "kill",
+        "link",
+        "linkat",
+        "listen",
+        "lseek",
+        "lstat",
+        "madvise",
+        "memfd_create",
+        "mkdir",
+        "mkdirat",
+        "mmap",
+        "mprotect",
+        "munmap",
+        "nanosleep",
+        "newfstatat",
+        "open",
+        "openat",
+        "pause",
+        "pipe",
+        "pipe2",
+        "poll",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "pselect6",
+        "pwrite64",
+        "read",
+        "readlink",
+        "readlinkat",
+        "recv",
+        "recvfrom",
+        "recvmsg",
+        "rename",
+        "restart_syscall",
+        "rmdir",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigreturn",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "rt_tgsigqueueinfo",
+        "sched_getaffinity",
+        "sched_getparam",
+        "sched_getscheduler",
+        "sched_setscheduler",
+        "sched_yield",
+        "select",
+        "semctl",
+        "semget",
+        "semop",
+        "send",
+        "sendmsg",
+        "sendto",
+        "set_robust_list",
+        "set_tid_address",
+        "setitimer",
+        "setsid",
+        "setsockopt",
+        "shutdown",
+        "sigaltstack",
+        "signalfd4",
+        "socket",
+        "socketpair",
+        "stat",
+        "statfs",
+        "symlink",
+        "symlinkat",
+        "sysinfo",
+        "tee",
+        "tgkill",
+        "time",
+        "timer_create",
+        "timer_delete",
+        "timer_getoverrun",
+        "timer_settime",
+        "times",
+        "tkill",
+        "truncate",
+        "umask",
+        "uname",
+        "unlink",
+        "unlinkat",
+        "utime",
+        "utimensat",
+        "utimes",
+        "wait4",
+        "waitid",
+        "waitpid",
+        "write"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}
+EOF
+
+  # Write Docker daemon config, referencing the seccomp profile path
+  sudo -u "$DOCKER_USER" tee "$daemon_config" >/dev/null <<EOF
+{
+  "userns-remap": "default",
+  "no-new-privileges": true,
+  "icc": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 64000,
+      "Soft": 64000
+    }
+  },
+  "seccomp-profile": "$sec_profile"
+}
+EOF
+
+  log "---- User-level Docker daemon configuration and seccomp profile written"
+}
+
+
+# --- Tighten containerd via systemd override ---
+configure_system_daemon() {
+  log "---- Applying systemd override for containerd"
+  mkdir -p /etc/systemd/system/containerd.service.d
+  tee /etc/systemd/system/containerd.service.d/override.conf >/dev/null <<EOF
+[Service]
+LimitNOFILE=65536
+ProtectSystem=full
+ProtectHome=yes
+EOF
+  systemctl daemon-reload
+  systemctl restart containerd
+}
+
+# --- Generate and wire TLS certs into global daemon.json ---
+setup_tls() {
+  local cert_dir="/home/$DOCKER_USER/.docker/certs"
+  log "---- Setting up TLS certs for rootless Docker API"
+
+  if [[ ! -d "$cert_dir" ]]; then
+    sudo -u "$DOCKER_USER" mkdir -p "$cert_dir"
+
+    sudo -u "$DOCKER_USER" openssl genrsa -out "$cert_dir/ca-key.pem" 4096
+    sudo -u "$DOCKER_USER" openssl req -x509 -new -nodes -key "$cert_dir/ca-key.pem" \
+      -sha256 -days 365 -out "$cert_dir/ca.pem" -subj "/CN=docker-ca"
+
+    sudo -u "$DOCKER_USER" openssl genrsa -out "$cert_dir/server-key.pem" 4096
+    sudo -u "$DOCKER_USER" openssl req -new -key "$cert_dir/server-key.pem" \
+      -out "$cert_dir/server.csr" -subj "/CN=$(hostname)"
+
+    sudo -u "$DOCKER_USER" openssl x509 -req -in "$cert_dir/server.csr" -CA "$cert_dir/ca.pem" \
+      -CAkey "$cert_dir/ca-key.pem" -CAcreateserial \
+      -out "$cert_dir/server-cert.pem" -days 365 -sha256
+
+    sudo chmod 600 "$cert_dir"/*.pem
+    sudo chown -R "$DOCKER_USER":"$DOCKER_USER" "$cert_dir"
+
+    local daemon_config="/home/$DOCKER_USER/.config/docker/daemon.json"
+
+    # Ensure daemon config exists or create empty JSON object
+    if [[ ! -f "$daemon_config" ]]; then
+      sudo -u "$DOCKER_USER" mkdir -p "$(dirname "$daemon_config")"
+      echo "{}" | sudo -u "$DOCKER_USER" tee "$daemon_config" > /dev/null
+    fi
+
+    # Update daemon.json to enable TLS and listen on TCP + unix socket
+    sudo -u "$DOCKER_USER" jq \
+      '. + {
+        "hosts": ["unix:///run/user/'"$(id -u "$DOCKER_USER")"'/docker.sock", "tcp://0.0.0.0:2376"],
+        "tls": true,
+        "tlsverify": true,
+        "tlscacert": "'"$cert_dir"'/ca.pem",
+        "tlscert": "'"$cert_dir"'/server-cert.pem",
+        "tlskey": "'"$cert_dir"'/server-key.pem"
+      }' "$daemon_config" > "$daemon_config.tmp" \
+      && sudo -u "$DOCKER_USER" mv "$daemon_config.tmp" "$daemon_config"
+
+    # Instead of restarting the service directly, use lingering and a user session to get around some annoyances and excessive caffine intake.
+      log "---- Restarting rootless Docker to apply TLS config"
+      if runuser -l "$DOCKER_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u $DOCKER_USER) systemctl --user restart docker"; then
+      log "Rootless Docker restarted successfully"
+     else
+      log "Failed to restart Docker via systemctl --user (missing session bus)"
+      log "Try manually: sudo -u $DOCKER_USER systemctl --user restart docker"
+     fi
+  else
+    log "TLS certs already exist"
+  fi
+}
+
+
+# --- AppArmor profile for the Docker user ---
+setup_apparmor() {
+  log "---- Creating AppArmor profile for $DOCKER_USER"
+  local profile="/etc/apparmor.d/docker-${DOCKER_USER}"
+  tee "$profile" >/dev/null <<EOF
+#include <tunables/global>
+profile docker-${DOCKER_USER} flags=(attach_disconnected) {
+  # Basic capabilities and file read access
+  # Deny reading/writing other users' home dirs or sensitive system files
+  # Allow standard file usage
+  file,
+  capability,
+  network,
+  # Deny access to all other home directories
+  deny /home/*/ r,
+  deny /home/*/** rwk,
+  # Explicitly allow access to dockeruser's home
+  /home/${DOCKER_USER}/ r,
+  /home/${DOCKER_USER}/** rwk,
+  # Prevent umount operations
+  deny umount,
+}
+
+EOF
+  apparmor_parser -r "$profile" || { log "AppArmor parse failed"; exit 1; }
+  aa-enforce "docker-${DOCKER_USER}" || { log "AppArmor enforce failed"; exit 1; }
+  systemctl reload apparmor
+  if ! aa-status | grep -q "docker-${DOCKER_USER}"; then
+    log "Profile docker-${DOCKER_USER} NOT enforced!"
+    exit 1
+  fi
+}
+
+# --- Auditd rule for docker exec calls ---
+setup_auditd() {
+  log "---- Applying auditd rule for docker exec"
+  if ! grep -q "/usr/bin/docker.*-k docker_exec" /etc/audit/rules.d/docker.rules 2>/dev/null; then
+    tee /etc/audit/rules.d/docker.rules >/dev/null <<EOF
+-w /usr/bin/docker -p x -k docker_exec
+-w /usr/bin/docker -p x -k docker_run
+-w /usr/bin/docker -p x -k docker_cp
+
+EOF
+    augenrules --load
+  else
+    log "Auditd rule already present"
+  fi
+}
+
+# --- Install Falco via official APT repo on Debian ---
+install_falco() {
+  log "---- Installing Falco for runtime visibility"
+  if ! command -v falco &>/dev/null; then
+    # Add apt-transport-https for older Debian versions
+    apt_retry apt install -y apt-transport-https || true
+
+    # Import Falco GPG key
+    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
+      | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
+
+    # Add Falco repository
+    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] \
+https://download.falco.org/packages/deb stable main" \
+      | tee /etc/apt/sources.list.d/falcosecurity.list
+
+    export DEBIAN_FRONTEND=noninteractive
+    export FALCO_DRIVER_CHOICE=ebpf
+
+    apt_retry apt update
+    apt_retry apt install -y dialog falco
+
+    log "Falco installed successfully"
+  else
+    log "Falco already installed"
+  fi
+
+  log "---- Enabling and starting Falco"
+  systemctl enable falco
+  systemctl restart falco
+
+  if systemctl is-active --quiet falco; then
+    log "Falco is running"
+  else
+    log "Falco failed to start; check 'journalctl -u falco'"
+    exit 1
+  fi
+}
+
+
+# --- Disable default docker0 bridge and NAT rule ---
+disable_default_bridge() {
+  log "---- Disabling docker0 bridge"
+  ip link set docker0 down 2>/dev/null || log "docker0 not found"
+  iptables -t nat -D POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null \
+    || true
+}
+
+# --- Create internal Docker network securely ---
+create_secure_net() {
+  log "---- Creating internal Docker network 'secure_net'"
+  if ! sudo -u "$DOCKER_USER" docker network ls --format '{{.Name}}' \
+      | grep -qw secure_net; then
+    sudo -u "$DOCKER_USER" docker network create \
+      --driver bridge --internal secure_net
+  else
+    log "Network 'secure_net' already exists"
+  fi
+}
+
+# --- Configure Fail2Ban for Docker API abuse ---
+setup_fail2ban() {
+  log "---- Setting up Fail2Ban for Docker API"
+  tee /etc/fail2ban/filter.d/docker-api.conf >/dev/null <<EOF
+[Definition]
+failregex = .* "POST /v[0-9\.]+/containers/create HTTP/1.1" 403
+ignoreregex =
+EOF
+
+  tee /etc/fail2ban/jail.local >/dev/null <<EOF
+[docker-api]
+enabled = true
+port = 2376
+filter = docker-api
+logpath = /var/log/syslog
+maxretry = 3
+EOF
+
+  systemctl restart fail2ban
+}
+
+# --- Apply iptables rules and persist ---
+setup_iptables() {
+  log "---- Applying firewall rules for Docker API"
+  iptables -C INPUT -p tcp --dport 2376 -s 127.0.0.1 -j ACCEPT 2>/dev/null \
+    || iptables -A INPUT -p tcp --dport 2376 -s 127.0.0.1 -j ACCEPT
+  iptables -C INPUT -p tcp --dport 2376 -j DROP 2>/dev/null \
+    || iptables -A INPUT -p tcp --dport 2376 -j DROP
+
+  log "---- Persisting iptables rules"
+  if ! netfilter-persistent save; then
+    log "netfilter-persistent failed—inspect /etc/iptables"
+    exit 1
+  fi
+}
+
+# --- Logrotate for rootless Docker logs ---
+setup_logrotate() {
+  log "---- Configuring logrotate for Docker logs"
+  tee /etc/logrotate.d/docker >/dev/null <<EOF
+/home/$DOCKER_USER/.local/share/docker/containers/*/*.log {
+  rotate 7
+  daily
+  compress
+  missingok
+  delaycompress
+  copytruncate
+}
+EOF
+}
+
+# --- Final sanity checks ---
+final_verification() {
+  log "---- Final checks"
+
+  if ! sudo -u "$DOCKER_USER" docker info | grep -iq rootless; then
+    log "Docker is not running in rootless mode!"
+  fi
+
+  if command -v loginctl &>/dev/null; then
+    [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value)" == "yes" ]] \
+      || log "Lingering is not enabled for $DOCKER_USER"
+  else
+    log "Cannot verify lingering—loginctl missing"
+  fi
+
+  auditctl -l | grep -q docker_exec || log "Audit rule 'docker_exec' missing"
+  aa-status | grep -q "docker-${DOCKER_USER}" \
+    || log "AppArmor profile not enforced"
+  ss -tuln | grep -q :2376 || log "Docker API not listening on 2376"
+}
+
+# --- Main dispatcher, tweak shit here ---
+main() {
+
+  ensure_root
+  add_docker_repo
+  install_packages
+
+  validate_dependencies
+
+  create_user
+  enable_lingering
+  setup_rootless
+  wait_for_docker
+
+  configure_user_daemon
+  configure_system_daemon
+  setup_tls
+
+  setup_apparmor
+  setup_auditd
+  install_falco
+  disable_default_bridge
+  create_secure_net
+  setup_fail2ban
+  setup_iptables
+  setup_logrotate
+
+  final_verification
+
+  log "Docker hardening complete, maybe. If something breaks, at least it broke securely."
+}
+
+main "$@"
