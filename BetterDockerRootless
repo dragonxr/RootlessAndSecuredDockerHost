@@ -98,7 +98,7 @@ add_docker_repo() {
 
   if ! grep -q "download.docker.com" "$repo_file" 2>/dev/null; then
     log "---- Downloading and installing Docker GPG key"
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o "$keyring"
+    curl -fsSL https://download.docker.com/linux/debian/gpg |  tee "$keyring" > /dev/null
 
     chmod 644 "$keyring"
 
