@@ -1,5 +1,5 @@
 #!/bin/bash
-
+-
 ## written by a tired Engineer at God knows when in the morning,
 ## now with less root and more paranoia, coming to a console near you.
 ## Works for me, but might not have been checked with enough caffeine.
@@ -648,7 +648,7 @@ setup_iptables() {
 
   log "---- Persisting iptables rules"
   if ! netfilter-persistent save; then
-    log "netfilter-persistent failed—inspect /etc/iptables"
+    log "netfilter-persistent failed-inspect /etc/iptables"
     exit 1
   fi
 }
@@ -680,7 +680,7 @@ final_verification() {
     [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value)" == "yes" ]] \
       || log "Lingering is not enabled for $DOCKER_USER"
   else
-    log "Cannot verify lingering—loginctl missing"
+    log "Cannot verify lingering-loginctl missing"
   fi
 
   auditctl -l | grep -q docker_exec || log "Audit rule 'docker_exec' missing"
