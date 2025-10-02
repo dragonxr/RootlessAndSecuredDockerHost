@@ -664,6 +664,8 @@ setup_logrotate() {
   missingok
   delaycompress
   copytruncate
+chattr +i /var/log/auth.log
+chattr +i /var/log/syslog
 }
 EOF
 }
@@ -682,6 +684,8 @@ echo 0 > /proc/sys/kernel/core_pattern
 }
 EOF
 }
+
+
 
 
 # --- Final sanity checks ---
