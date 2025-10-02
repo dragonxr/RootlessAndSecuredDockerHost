@@ -679,8 +679,6 @@ echo 1 > /proc/sys/kernel/dmesg_restrict
 echo '* hard core 0' >> /etc/security/limits.conf
 echo 0 > /proc/sys/kernel/core_pattern
 }
-EOF
-}
 
 
 
