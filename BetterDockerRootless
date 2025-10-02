@@ -656,6 +656,8 @@ setup_iptables() {
 # --- Logrotate for rootless Docker logs ---
 setup_logrotate() {
   log "---- Configuring logrotate for Docker logs"
+chattr +i /var/log/auth.log
+chattr +i /var/log/syslog
   tee /etc/logrotate.d/docker >/dev/null <<EOF
 /home/$DOCKER_USER/.local/share/docker/containers/*/*.log {
   rotate 7
@@ -664,8 +666,6 @@ setup_logrotate() {
   missingok
   delaycompress
   copytruncate
-chattr +i /var/log/auth.log
-chattr +i /var/log/syslog
 }
 EOF
 }
