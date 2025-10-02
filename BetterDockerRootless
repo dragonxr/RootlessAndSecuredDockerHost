@@ -15,6 +15,7 @@ curl
 gnupg
 lsb-release
 apparmor
+apparmor-utils
 auditd
 fail2ban
 uidmap
@@ -457,15 +458,12 @@ setup_tls() {
     sudo -u "$DOCKER_USER" mkdir -p "$cert_dir"
 
     sudo -u "$DOCKER_USER" openssl genrsa -out "$cert_dir/ca-key.pem" 4096
-    sudo -u "$DOCKER_USER" openssl req -x509 -new -nodes -key "$cert_dir/ca-key.pem" \
-      -sha256 -days 365 -out "$cert_dir/ca.pem" -subj "/CN=docker-ca"
+    sudo -u "$DOCKER_USER" openssl req -x509 -new -nodes -key "$cert_dir/ca-key.pem" -sha256 -days 365 -out "$cert_dir/ca.pem" -subj "/CN=docker-ca"
 
     sudo -u "$DOCKER_USER" openssl genrsa -out "$cert_dir/server-key.pem" 4096
-    sudo -u "$DOCKER_USER" openssl req -new -key "$cert_dir/server-key.pem" \
-      -out "$cert_dir/server.csr" -subj "/CN=$(hostname)"
+    sudo -u "$DOCKER_USER" openssl req -new -key "$cert_dir/server-key.pem" -out "$cert_dir/server.csr" -subj "/CN=$(hostname)"
 
-    sudo -u "$DOCKER_USER" openssl x509 -req -in "$cert_dir/server.csr" -CA "$cert_dir/ca.pem" \
-      -CAkey "$cert_dir/ca-key.pem" -CAcreateserial \
+    sudo -u "$DOCKER_USER" openssl x509 -req -in "$cert_dir/server.csr" -CA "$cert_dir/ca.pem" -CAkey "$cert_dir/ca-key.pem" -CAcreateserial \
       -out "$cert_dir/server-cert.pem" -days 365 -sha256
 
     sudo chmod 600 "$cert_dir"/*.pem
@@ -488,8 +486,7 @@ setup_tls() {
         "tlscacert": "'"$cert_dir"'/ca.pem",
         "tlscert": "'"$cert_dir"'/server-cert.pem",
         "tlskey": "'"$cert_dir"'/server-key.pem"
-      }' "$daemon_config" > "$daemon_config.tmp" \
-      && sudo -u "$DOCKER_USER" mv "$daemon_config.tmp" "$daemon_config"
+      }' "$daemon_config" > "$daemon_config.tmp" && sudo -u "$DOCKER_USER" mv "$daemon_config.tmp" "$daemon_config"
 
     # Instead of restarting the service directly, use lingering and a user session to get around some annoyances and excessive caffine intake.
       log "---- Restarting rootless Docker to apply TLS config"
@@ -562,13 +559,10 @@ install_falco() {
     apt_retry apt install -y apt-transport-https || true
 
     log "---- Import Falco GPG key"
-    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
-      | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
+    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
 
     log "---- Add Falco repository"
-    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] \
-https://download.falco.org/packages/deb stable main" \
-      | tee /etc/apt/sources.list.d/falcosecurity.list
+    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | tee /etc/apt/sources.list.d/falcosecurity.list
 
     export DEBIAN_FRONTEND=noninteractive
     export FALCO_DRIVER_CHOICE=ebpf
@@ -598,17 +592,14 @@ https://download.falco.org/packages/deb stable main" \
 disable_default_bridge() {
   log "---- Disabling docker0 bridge"
   ip link set docker0 down 2>/dev/null || log "docker0 not found"
-  iptables -t nat -D POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null \
-    || true
+  iptables -t nat -D POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
 }
 
 # --- Create internal Docker network securely ---
 create_secure_net() {
   log "---- Creating internal Docker network 'secure_net'"
-  if ! sudo -u "$DOCKER_USER" docker network ls --format '{{.Name}}' \
-      | grep -qw secure_net; then
-    sudo -u "$DOCKER_USER" docker network create \
-      --driver bridge --internal secure_net
+  if ! sudo -u "$DOCKER_USER" docker network ls --format '{{.Name}}' | grep -qw secure_net; then
+    sudo -u "$DOCKER_USER" docker network create --driver bridge --internal secure_net
   else
     log "---- Network 'secure_net' already exists"
   fi
@@ -638,10 +629,8 @@ EOF
 # --- Apply iptables rules and persist ---
 setup_iptables() {
   log "---- Applying firewall rules for Docker API"
-  iptables -C INPUT -p tcp --dport 2376 -s 127.0.0.1 -j ACCEPT 2>/dev/null \
-    || iptables -A INPUT -p tcp --dport 2376 -s 127.0.0.1 -j ACCEPT
-  iptables -C INPUT -p tcp --dport 2376 -j DROP 2>/dev/null \
-    || iptables -A INPUT -p tcp --dport 2376 -j DROP
+  iptables -C INPUT -p tcp --dport 2376 -s 127.0.0.1 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 2376 -s 127.0.0.1 -j ACCEPT
+  iptables -C INPUT -p tcp --dport 2376 -j DROP 2>/dev/null || iptables -A INPUT -p tcp --dport 2376 -j DROP
 
   log "---- Persisting iptables rules"
   if ! netfilter-persistent save; then
@@ -692,15 +681,13 @@ final_verification() {
   fi
 
   if command -v loginctl &>/dev/null; then
-    [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value)" == "yes" ]] \
-      || log "Lingering is not enabled for $DOCKER_USER"
+    [[ "$(loginctl show-user "$DOCKER_USER" -p Linger --value)" == "yes" ]] || log "Lingering is not enabled for $DOCKER_USER"
   else
     log "Cannot verify lingering-loginctl missing"
   fi
 
   auditctl -l | grep -q docker_exec || log "Audit rule 'docker_exec' missing"
-  aa-status | grep -q "docker-${DOCKER_USER}" \
-    || log "AppArmor profile not enforced"
+  aa-status | grep -q "docker-${DOCKER_USER}" || log "AppArmor profile not enforced"
   ss -tuln | grep -q :2376 || log "Docker API not listening on 2376"
 }
 
