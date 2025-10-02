@@ -225,7 +225,7 @@ wait_for_docker() {
     }
     sleep 3
   done
-  log "Docker is online"
+  log "---- Docker is online"
 }
 
 
@@ -497,13 +497,13 @@ setup_tls() {
     # Instead of restarting the service directly, use lingering and a user session to get around some annoyances and excessive caffine intake.
       log "---- Restarting rootless Docker to apply TLS config"
       if runuser -l "$DOCKER_USER" -c "XDG_RUNTIME_DIR=/run/user/$(id -u $DOCKER_USER) systemctl --user restart docker"; then
-      log "Rootless Docker restarted successfully"
+      log "---- Rootless Docker restarted successfully"
      else
       log "Failed to restart Docker via systemctl --user (missing session bus)"
       log "Try manually: sudo -u $DOCKER_USER systemctl --user restart docker"
      fi
   else
-    log "TLS certs already exist"
+    log "---- TLS certs already exist"
   fi
 }
 
@@ -553,7 +553,7 @@ setup_auditd() {
 EOF
     augenrules --load
   else
-    log "Auditd rule already present"
+    log "---- Auditd rule already present"
   fi
 }
 
@@ -564,11 +564,11 @@ install_falco() {
     # Add apt-transport-https for older Debian versions
     apt_retry apt install -y apt-transport-https || true
 
-    # Import Falco GPG key
+    log "---- Import Falco GPG key"
     curl -fsSL https://falco.org/repo/falcosecurity-packages.asc \
       | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
 
-    # Add Falco repository
+    log "---- Add Falco repository"
     echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] \
 https://download.falco.org/packages/deb stable main" \
       | tee /etc/apt/sources.list.d/falcosecurity.list
@@ -579,9 +579,9 @@ https://download.falco.org/packages/deb stable main" \
     apt_retry apt update
     apt_retry apt install -y dialog falco
 
-    log "Falco installed successfully"
+    log "---- Falco installed successfully"
   else
-    log "Falco already installed"
+    log "---- Falco already installed"
   fi
 
   log "---- Enabling and starting Falco"
@@ -613,7 +613,7 @@ create_secure_net() {
     sudo -u "$DOCKER_USER" docker network create \
       --driver bridge --internal secure_net
   else
-    log "Network 'secure_net' already exists"
+    log "---- Network 'secure_net' already exists"
   fi
 }
 
