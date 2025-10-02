@@ -45,10 +45,14 @@ log() {
 
 # --- Pre-flight: must be root ---
 ensure_root() {
-  if [[ "$EUID" -ne 0 ]]; then
-    log "You need root for this. Maybe try 'sudo'."
-    exit 1
-  fi
+  set -Eeuo pipefail
+  IFS=$'\n\t'
+  [[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }
+  command -v systemctl >/dev/null || { echo "systemd required"; exit 1; }
+  command -v apt-get   >/dev/null || { echo "apt required"; exit 1; }
+  OS_ID="$(. /etc/os-release; echo "${ID}")"
+  OS_CODENAME="$(. /etc/os-release; echo "${VERSION_CODENAME}")"
+  ARCH="$(dpkg --print-architecture)"
 }
 
 # --- Retry apt operations to avoid lock contention ---
@@ -94,17 +98,14 @@ add_docker_repo() {
 
   if ! grep -q "download.docker.com" "$repo_file" 2>/dev/null; then
     log "Downloading and installing Docker GPG key"
-    curl -fsSL https://download.docker.com/linux/debian/gpg | \
-      tee "$keyring" > /dev/null
+    curl -fsSL https://download.docker.com/linux/debian/gpg | tee "$keyring" > /dev/null
 
     chmod 644 "$keyring"
 
     log "Adding Docker APT repository"
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] \
-https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
-      | tee "$repo_file" > /dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] https://download.docker.com/linux/debian $(lsb_release -cs) stable"  | tee "$repo_file" > /dev/null
 
-    apt_retry apt update
+     apt_retry apt update
   else
     log "Docker APT repository already present"
   fi
@@ -113,10 +114,11 @@ https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
 # --- Verify essential binaries exist ---
 validate_dependencies() {
   log "---- Validating essential Docker tools presence"
-  command -v dockerd-rootless-setuptool.sh &>/dev/null \
-    || { log "Missing dockerd-rootless-setuptool.sh"; exit 1; }
-  command -v docker &>/dev/null \
-    || { log "Missing docker CLI"; exit 1; }
+  command -v dockerd-rootless-setuptool.sh &>/dev/null || { log "Missing dockerd-rootless-setuptool.sh"; exit 1; }
+  command -v docker &>/dev/null || { log "Missing docker CLI"; exit 1; }
+  command -v newuidmap >/dev/null || {log "Missing uidmap (should be installed)"; exit 1; }
+  command -v slirp4netns >/dev/null || {log "Missing slirp4netns"; exit 1; }
+  command -v fuse-overlayfs >/dev/null || {log "Missing fuse-overlayfs"; exit 1; }
 }
 
 # --- Create and configure non-root Docker user ---
@@ -127,10 +129,8 @@ create_user() {
   fi
 
   log "---- Ensuring subuid/subgid mappings"
-  grep -q "^${DOCKER_USER}:" /etc/subuid \
-    || echo "${DOCKER_USER}:100000:65536" >> /etc/subuid
-  grep -q "^${DOCKER_USER}:" /etc/subgid \
-    || echo "${DOCKER_USER}:100000:65536" >> /etc/subgid
+  grep -q "^${DOCKER_USER}:" /etc/subuid || echo "${DOCKER_USER}:100000:65536" >> /etc/subuid
+  grep -q "^${DOCKER_USER}:" /etc/subgid || echo "${DOCKER_USER}:100000:65536" >> /etc/subgid
   chmod 644 /etc/subuid /etc/subgid
 
   log "---- Adding $DOCKER_USER to docker group"
@@ -205,13 +205,10 @@ setup_rootless() {
     sudo rm -f /var/run/docker.sock
   fi
   log "---- Setting up rootless Docker"
-  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" \
-    dockerd-rootless-setuptool.sh install
+  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" dockerd-rootless-setuptool.sh install || true
   # Use explicit XDG_RUNTIME_DIR for systemctl --user calls
-  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" \
-    systemctl --user enable docker
-  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" \
-    systemctl --user start docker
+  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" systemctl --user enable docker
+  sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" systemctl --user start docker
 }
 
 
@@ -723,9 +720,10 @@ main() {
   setup_rootless
   wait_for_docker
 
+  setup_tls
   configure_user_daemon
   configure_system_daemon
-  setup_tls
+  
 
   setup_apparmor
   setup_auditd
