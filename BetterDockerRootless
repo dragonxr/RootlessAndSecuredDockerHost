@@ -97,17 +97,17 @@ add_docker_repo() {
   local repo_file="/etc/apt/sources.list.d/docker.list"
 
   if ! grep -q "download.docker.com" "$repo_file" 2>/dev/null; then
-    log "Downloading and installing Docker GPG key"
-    curl -fsSL https://download.docker.com/linux/debian/gpg | tee "$keyring" > /dev/null
+    log "---- Downloading and installing Docker GPG key"
+    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o "$keyring"
 
     chmod 644 "$keyring"
 
-    log "Adding Docker APT repository"
+    log "---- Adding Docker APT repository"
     echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] https://download.docker.com/linux/debian $(lsb_release -cs) stable"  | tee "$repo_file" > /dev/null
 
      apt_retry apt update
   else
-    log "Docker APT repository already present"
+    log "---- Docker APT repository already present"
   fi
 }
 
