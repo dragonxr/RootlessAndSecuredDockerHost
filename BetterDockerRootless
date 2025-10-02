@@ -668,6 +668,22 @@ setup_logrotate() {
 EOF
 }
 
+# --- Apply Kernal Hardening ---
+configure_kernal_hardening() {
+log "---- Configuring Kernal hardning and sysctl flags"
+
+echo 2 > /proc/sys/kernel/kptr_restrict
+echo 1 > /proc/sys/kernel/dmesg_restrict
+echo 1 > /proc/sys/kernel/yama/ptrace_scope
+echo 1 > /proc/sys/kernel/kptr_restrict
+echo 1 > /proc/sys/kernel/dmesg_restrict
+echo '* hard core 0' >> /etc/security/limits.conf
+echo 0 > /proc/sys/kernel/core_pattern
+}
+EOF
+}
+
+
 # --- Final sanity checks ---
 final_verification() {
   log "---- Final checks"
@@ -715,6 +731,7 @@ main() {
   setup_fail2ban
   setup_iptables
   setup_logrotate
+  configure_kernal_hardening
 
   final_verification
 
