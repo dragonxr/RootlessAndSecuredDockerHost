@@ -115,10 +115,10 @@ add_docker_repo() {
 validate_dependencies() {
   log "---- Validating essential Docker tools presence"
   command -v dockerd-rootless-setuptool.sh &>/dev/null || { log "Missing dockerd-rootless-setuptool.sh"; exit 1 }
-  command -v docker &>/dev/null || { log "Missing docker CLI"; exit 1 }
-  command -v newuidmap >/dev/null || {log "Missing uidmap"; exit 1 }
-  command -v slirp4netns >/dev/null || {log "Missing slirp4netns"; exit 1 }
-  command -v fuse-overlayfs >/dev/null || {log "Missing fuse-overlayfs"; exit 1 }
+  command -v docker &>/dev/null 2>&1 || { log "Missing docker CLI"; exit 1 ; }
+  command -v newuidmap >/dev/null 2>&1 || { log "Missing uidmap"; exit 1 ; }
+  command -v slirp4netns >/dev/null 2>&1 || { log "Missing slirp4netns"; exit 1 ; }
+  command -v fuse-overlayfs >/dev/null 2>&1 || { log "Missing fuse-overlayfs"; exit 1 ; }
 }
 
 # --- Create and configure non-root Docker user ---
