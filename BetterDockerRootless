@@ -619,32 +619,49 @@ EOF
 # --- End of Auditd rule for docker exec calls ---
 
 # --- Install Falco via official APT repo on Debian ---
-  log "---- Installing Falco"
 
-  export DEBIAN_FRONTEND=noninteractive
-  export FALCOCTL_ENABLED=no
+install_falco() {
+  log "---- Installing Falco (modern eBPF preferred)"
+export DEBIAN_FRONTEND=noninteractive FALCOCTL_ENABLED=no
 
+# --- Repo (ASCII key + Signed-By) if missing
+  if ! grep -qs 'download.falco.org' /etc/apt/sources.list.d/falcosecurity.list 2>/dev/null; then
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | safe_write_block /etc/apt/keyrings/falco.asc 0644 root:root
+    echo 'deb [signed-by=/etc/apt/keyrings/falco.asc] https://download.falco.org/packages/deb stable main' | safe_write_block /etc/apt/sources.list.d/falcosecurity.list 0644 root:root
+    apt_retry apt-get update
+  fi
+
+  # Driver choice: modern eBPF (CO-RE) if BTF present; else classic eBPF with minimal deps
   if [ -e /sys/kernel/btf/vmlinux ]; then
     export FALCO_DRIVER_CHOICE=modern_ebpf
-    log "---- Using Falco modern eBPF (BTF detected)"
+    log "---- BTF found → using modern_ebpf (no headers/toolchain)"
   else
     export FALCO_DRIVER_CHOICE=ebpf
-    log "BTF not detected; using classic eBPF (requires headers/toolchain)"
-    apt_retry apt-get install -y linux-headers-$(uname -r) make || {
-      log "Headers for $(uname -r) not found. If you upgraded the kernel, reboot, then rerun."
-      exit 1
-    }
+    log "---- No BTF → using classic eBPF probe (headers/toolchain minimal)"
+    apt_retry apt-get install -y "linux-headers-$(uname -r)" clang llvm make libelf-dev zlib1g-dev || {
+   log "Headers/toolchain not available for $(uname -r). Reboot into the new kernel or enable BTF."; exit 1; }
   fi
 
-  if ! command -v falco &>/dev/null; then
-    apt_retry apt-get update
-    apt_retry apt-get install -y dialog falco
-  fi
-
+  # Install & enable
+  apt_retry apt-get install -y dialog falco
   systemctl enable falco
   systemctl restart falco || { log "Falco failed to start"; exit 1; }
-  log "Falco is running"
+
+  # Pin engine.kind to what we chose (keeps config explicit)
+  local yaml=/etc/falco/falco.yaml kind
+  kind=$([ "$FALCO_DRIVER_CHOICE" = modern_ebpf ] && echo modern_ebpf || echo ebpf)
+  if [ -f "$yaml" ]; then
+    if grep -qE '^[[:space:]]*engine\.kind:' "$yaml"; then
+      sed -i -E "s|^[[:space:]]*engine\.kind:.*|engine.kind: $kind|" "$yaml"
+    else
+      printf '\nengine.kind: %s\n' "$kind" >> "$yaml"
+    fi
+  fi
+
+  log "Falco running with driver: $FALCO_DRIVER_CHOICE"
 }
+
 # --- End of Falco Install via official APT repo on Debian ---
 
 # --- Disable default docker0 bridge and NAT rule ---
