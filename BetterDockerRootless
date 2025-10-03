@@ -101,19 +101,20 @@ install_packages() {
 add_docker_repo() {
   log "---- Checking Docker APT repo; adding if missing"
 
-  local keyring="/etc/apt/keyrings/docker.gpg"
+  local keyring="/etc/apt/keyrings/docker.asc"
   local repo_file="/etc/apt/sources.list.d/docker.list"
-
+  
   if ! grep -q "download.docker.com" "$repo_file" 2>/dev/null; then
     log "---- Downloading and installing Docker GPG key"
-    curl -fsSL https://download.docker.com/linux/debian/gpg |  tee "$keyring" > /dev/null
-
-    chmod 644 "$keyring"
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/debian/gpg | safe_write_block /etc/apt/keyrings/docker.asc 0644 root:root
 
     log "---- Adding Docker APT repository"
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=$keyring] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | safe_write_block $repo_file 0644 root:root
+cat <<'EOF' | safe_write_block /etc/apt/sources.list.d/docker.list 0644 root:root
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release; echo $VERSION_CODENAME) stable
+EOF
 
-     apt_retry apt update -y
+ apt_retry apt update
 
   else
     log "---- Docker APT repository already present"
