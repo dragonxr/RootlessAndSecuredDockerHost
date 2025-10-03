@@ -590,10 +590,10 @@ deny umount,
 EOF
 
 apparmor_parser -r "$profile" || { log "AppArmor parse failed"; exit 1; }
-aa-enforce "docker-${DOCKER_USER}" || { log "AppArmor enforce failed"; exit 1; }
+aa-enforce "${DOCKER_USER}" || { log "AppArmor enforce failed"; exit 1; }
 systemctl reload apparmor
-  if ! aa-status | grep -q "docker-${DOCKER_USER}"; then
-    log "Profile docker-${DOCKER_USER} NOT enforced!"
+  if ! aa-status | grep -q "${DOCKER_USER}"; then
+    log "Profile ${DOCKER_USER} NOT enforced!"
     exit 1
   fi
 }
@@ -755,7 +755,7 @@ final_verification() {
   fi
 
   auditctl -l | grep -q docker_exec || log "Audit rule 'docker_exec' missing"
-  aa-status | grep -q "docker-${DOCKER_USER}" || log "AppArmor profile not enforced"
+  aa-status | grep -q "${DOCKER_USER}" || log "AppArmor profile not enforced"
   ss -tuln | grep -q :2376 || log "Docker API not listening on 2376"
 }
 
