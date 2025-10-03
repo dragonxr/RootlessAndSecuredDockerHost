@@ -38,11 +38,13 @@ containerd.io
 docker-buildx-plugin
 docker-ce-rootless-extras
 )
+# --- End of Variables and Packages ---
 
-# --- Utility: timestamped logger ---
+# --- timestamped logger ---
 log() {
   echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
 }
+# --- End of timestamped logger ---
 
 # --- Pre-flight: must be root ---
 ensure_root() {
@@ -55,6 +57,7 @@ ensure_root() {
   OS_CODENAME="$(. /etc/os-release; echo "${VERSION_CODENAME}")"
   ARCH="$(dpkg --print-architecture)"
 }
+# --- End of Pre-flight ---
 
 # --- Retry apt operations to avoid lock contention ---
 apt_retry() {
@@ -69,6 +72,7 @@ apt_retry() {
     sleep 5
   done
 }
+# --- End of Retry apt operations ---
 
 # --- Install system deps if missing ---
 install_packages() {
@@ -91,6 +95,7 @@ install_packages() {
     fi
   done
 }
+# --- End of Installing system deps ---
 
 # --- Add Docker APT repository ---
 add_docker_repo() {
@@ -114,6 +119,7 @@ add_docker_repo() {
     log "---- Docker APT repository already present"
   fi
 }
+# --- End of Adding Docker APT repository ---
 
 # --- Verify essential binaries exist ---
 validate_dependencies() {
@@ -124,6 +130,7 @@ validate_dependencies() {
   command -v slirp4netns >/dev/null 2>&1 || { log "Missing slirp4netns"; exit 1; }
   command -v fuse-overlayfs >/dev/null 2>&1 || { log "Missing fuse-overlayfs"; exit 1; }
 }
+# --- End of Verifying essential binaries ---
 
 # --- Atomic write: heredoc/pipe -> file (optional MODE, OWNER:GROUP) ---
 # --- Usage because i keep forgetting and i keep causing EOF escapes
@@ -154,9 +161,10 @@ safe_write_block() {
 
   mv -f -- "$tmp" "$target" || { rm -f "$tmp"; flock -u 200; return 1; }
   flock -u 200
-  # Intentionally leave "$lock" to avoid races; harmless and conventional
+# --- Intentionally leave "$lock" to avoid races; harmless and conventional
   log "---- Wrote $target"
 }
+# --- End of headache of EOF with safe_write_block ---
 
 
 # --- Create and configure non-root Docker user ---
@@ -178,6 +186,7 @@ create_user() {
   chown -R "$DOCKER_USER":"$DOCKER_USER" "/home/$DOCKER_USER"
   log "---- Ensuring home ownership done"
 }
+# --- End of Creating and configuring non-root Docker user ---
 
 # --- Enable systemd lingering for rootless services ---
 enable_lingering() {
@@ -216,7 +225,7 @@ enable_lingering() {
     log "---- Lingering already enabled for $DOCKER_USER"
   fi
 }
-
+# --- End of Enabling systemd lingering for rootless services ---
 
 # --- Set up rootless Docker daemon ---
 setup_rootless() {
@@ -248,8 +257,9 @@ setup_rootless() {
   sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" systemctl --user enable docker
   sudo -Hu "$DOCKER_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u $DOCKER_USER)" systemctl --user start docker
 }
+# --- End of Setting up rootless Docker daemon ---
 
-
+# --- Docker wait timer ---
 wait_for_docker() {
   log "---- Waiting for rootless Docker to come online"
   local timeout=30
@@ -262,7 +272,7 @@ wait_for_docker() {
   done
   log "---- Docker is online"
 }
-
+# --- End of Docker wait timer ---
 
 # --- Write user-level daemon.json with remap, logging, seccomp ---
 configure_user_daemon() {
@@ -275,7 +285,7 @@ configure_user_daemon() {
 # --- Create config directory
   sudo -u "$DOCKER_USER" mkdir -p "$cfg_dir"
 
-# Write the hardened seccomp profile (literal heredoc to prevent variable expansion)
+# ---  Write the hardened seccomp profile (literal heredoc to prevent variable expansion)
 # -- old method -- sudo -u "$DOCKER_USER" tee "$sec_profile" >/dev/null <<'EOF' --
 cat <<'EOF' | safe_write_block "/home/$DOCKER_USER/.config/docker/seccomp.json" 0644 "$DOCKER_USER:$DOCKER_USER"
 
@@ -448,6 +458,8 @@ cat <<'EOF' | safe_write_block "/home/$DOCKER_USER/.config/docker/seccomp.json" 
 }
 EOF
 
+# --- End of Writing the user-level daemon.json with remap, logging, seccomp ---
+
 # --- Write Docker daemon config, referencing the seccomp profile path ---
   sudo -u "$DOCKER_USER" tee "$daemon_config" >/dev/null <<EOF
 {
@@ -472,13 +484,13 @@ EOF
 
   log "---- User-level Docker daemon configuration and seccomp profile written"
 }
-
+# --- End of Writing Docker daemon config, referencing the seccomp profile path ---
 
 # --- Tighten containerd via systemd override ---
 configure_system_daemon() {
   log "---- Applying systemd override for containerd"
   mkdir -p /etc/systemd/system/containerd.service.d
-  tee /etc/systemd/system/containerd.service.d/override.conf >/dev/null <<EOF
+  cat <<'EOF' | safe_write_block /etc/systemd/system/containerd.service.d/override.conf 0644 root:root
 [Service]
 LimitNOFILE=65536
 ProtectSystem=full
@@ -487,6 +499,7 @@ EOF
   systemctl daemon-reload
   systemctl restart containerd
 }
+# --- End of Tightening containerd via systemd override ---
 
 # --- Generate and wire TLS certs into global daemon.json ---
 setup_tls() {
@@ -539,13 +552,13 @@ setup_tls() {
     log "---- TLS certs already exist"
   fi
 }
-
+# --- End of Generating wire TLS certs into global daemon.json ---
 
 # --- AppArmor profile for the Docker user ---
 setup_apparmor() {
   log "---- Creating AppArmor profile for $DOCKER_USER"
   local profile="/etc/apparmor.d/docker-${DOCKER_USER}"
-  tee "$profile" >/dev/null <<EOF
+cat <<'EOF' | safe_write_block "$profile" 0644 root:root
 #include <tunables/global>
 profile docker-${DOCKER_USER} flags=(attach_disconnected) {
 # Basic capabilities and file read access
@@ -563,32 +576,34 @@ deny /home/*/** rwk,
 # Prevent umount operations
 deny umount,
 }
-
 EOF
-  apparmor_parser -r "$profile" || { log "AppArmor parse failed"; exit 1; }
-  aa-enforce "docker-${DOCKER_USER}" || { log "AppArmor enforce failed"; exit 1; }
-  systemctl reload apparmor
+
+apparmor_parser -r "$profile" || { log "AppArmor parse failed"; exit 1; }
+aa-enforce "docker-${DOCKER_USER}" || { log "AppArmor enforce failed"; exit 1; }
+systemctl reload apparmor
   if ! aa-status | grep -q "docker-${DOCKER_USER}"; then
     log "Profile docker-${DOCKER_USER} NOT enforced!"
     exit 1
   fi
 }
+# --- End of AppArmor profile for the Docker user ---
 
 # --- Auditd rule for docker exec calls ---
 setup_auditd() {
   log "---- Applying auditd rule for docker exec"
 if ! grep -q "/usr/bin/docker.*-k docker_exec" /etc/audit/rules.d/docker.rules 2>/dev/null; then
-tee /etc/audit/rules.d/docker.rules >/dev/null <<EOF
+cat <<'EOF' | safe_write_block /etc/audit/rules.d/docker.rules 0640 root:root
 -w /usr/bin/docker -p x -k docker_exec
 -w /usr/bin/docker -p x -k docker_run
 -w /usr/bin/docker -p x -k docker_cp
-
 EOF
+
     augenrules --load
   else
     log "---- Auditd rule already present"
   fi
 }
+# --- End of Auditd rule for docker exec calls ---
 
 # --- Install Falco via official APT repo on Debian ---
 install_falco() {
@@ -601,7 +616,7 @@ install_falco() {
     curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
 
     log "---- Add Falco repository"
-    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | tee /etc/apt/sources.list.d/falcosecurity.list
+    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | safe_write_block /etc/apt/sources.list.d/falcosecurity.list 0644 root:root
 
     export DEBIAN_FRONTEND=noninteractive
     export FALCO_DRIVER_CHOICE=ebpf
@@ -625,7 +640,7 @@ install_falco() {
     exit 1
   fi
 }
-
+# --- End of Falco Install via official APT repo on Debian ---
 
 # --- Disable default docker0 bridge and NAT rule ---
 disable_default_bridge() {
@@ -633,6 +648,7 @@ disable_default_bridge() {
   ip link set docker0 down 2>/dev/null || log "docker0 not found"
   iptables -t nat -D POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE 2>/dev/null || true
 }
+# --- End of Disabling default docker0 bridge and NAT rule ---
 
 # --- Create internal Docker network securely ---
 create_secure_net() {
@@ -643,17 +659,18 @@ create_secure_net() {
     log "---- Network 'secure_net' already exists"
   fi
 }
+# --- End of Creating internal Docker network ---
 
 # --- Configure Fail2Ban for Docker API abuse ---
 setup_fail2ban() {
   log "---- Setting up Fail2Ban for Docker API"
-  tee /etc/fail2ban/filter.d/docker-api.conf >/dev/null <<EOF
+cat <<'EOF' | safe_write_block /etc/fail2ban/filter.d/docker-api.conf 0644 root:root
 [Definition]
 failregex = .* "POST /v[0-9\.]+/containers/create HTTP/1.1" 403
 ignoreregex =
 EOF
 
-  tee /etc/fail2ban/jail.local >/dev/null <<EOF
+cat <<'EOF' | safe_write_block /etc/fail2ban/jail.local 0644 root:root
 [docker-api]
 enabled = true
 port = 2376
@@ -662,8 +679,11 @@ logpath = /var/log/syslog
 maxretry = 3
 EOF
 
-  systemctl restart fail2ban
+systemctl restart fail2ban
+
 }
+# --- End of Fail2Ban for Docker API abuse ---
+
 
 # --- Apply iptables rules and persist ---
 setup_iptables() {
@@ -677,13 +697,14 @@ setup_iptables() {
     exit 1
   fi
 }
+## --- End of iptables rules and persist ---
 
 # --- Logrotate for rootless Docker logs ---
 setup_logrotate() {
   log "---- Configuring logrotate for Docker logs"
 chattr +i /var/log/auth.log
 chattr +i /var/log/syslog
-  tee /etc/logrotate.d/docker >/dev/null <<EOF
+cat <<'EOF' | safe_write_block /etc/logrotate.d/docker 0644 root:root
 /home/$DOCKER_USER/.local/share/docker/containers/*/*.log {
   rotate 7
   daily
