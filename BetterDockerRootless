@@ -77,7 +77,7 @@ apt_retry() {
 # --- Install system deps if missing ---
 install_packages() {
   log "---- Updating APT and installing system dependencies"
-  apt_retry apt update -y
+  apt_retry apt update
   apt_retry apt upgrade -y
   apt_retry apt dist-upgrade -y
 
@@ -281,12 +281,13 @@ configure_user_daemon() {
   local cfg_dir="/home/$DOCKER_USER/.config/docker"
   local sec_profile="$cfg_dir/seccomp.json"
   local daemon_config="$cfg_dir/daemon.json"
+  local cert_dir="/home/$DOCKER_USER/.docker/certs"
 
 # --- Create config directory
   sudo -u "$DOCKER_USER" mkdir -p "$cfg_dir"
 
+
 # ---  Write the hardened seccomp profile (literal heredoc to prevent variable expansion)
-# -- old method -- sudo -u "$DOCKER_USER" tee "$sec_profile" >/dev/null <<'EOF' --
 cat <<'EOF' | safe_write_block "/home/$DOCKER_USER/.config/docker/seccomp.json" 0644 "$DOCKER_USER:$DOCKER_USER"
 
 {
@@ -458,10 +459,8 @@ cat <<'EOF' | safe_write_block "/home/$DOCKER_USER/.config/docker/seccomp.json" 
 }
 EOF
 
-# --- End of Writing the user-level daemon.json with remap, logging, seccomp ---
-
 # --- Write Docker daemon config, referencing the seccomp profile path ---
-  sudo -u "$DOCKER_USER" tee "$daemon_config" >/dev/null <<EOF
+cat <<'EOF' | safe_write_block "$daemon_config" 0644 $DOCKER_USER:$DOCKER_USER
 {
   "userns-remap": "default",
   "no-new-privileges": true,
@@ -482,7 +481,7 @@ EOF
 }
 EOF
 
-  log "---- User-level Docker daemon configuration and seccomp profile written"
+log "---- User-level Docker daemon configuration and seccomp profile written"
 }
 # --- End of Writing Docker daemon config, referencing the seccomp profile path ---
 
