@@ -76,26 +76,26 @@ apt_retry() {
 }
 # --- End of Retry apt operations ---
 
-# --- Compact root FS auto-expander (plain partitions + LVM ext4/xfs/btrfs) ---
+## --- Compact root FS auto-expander (plain partitions + LVM ext4/xfs/btrfs) ---
 expand_rootfs_if_possible() {
   local src fs disk pnum lv pv name vg
 
-# --- Detect root device (canonical) and filesystem
+  # Detect root device (canonical) and filesystem
   src="$(readlink -f "$(findmnt -no SOURCE /)")" || return 0
   fs="$(findmnt -no FSTYPE / 2>/dev/null || echo)"
 
-# --- Skip if running in a container
+  # Skip if running in a container
   grep -qE '/docker|/lxc' /proc/1/cgroup && { log "---- Container detected, skipping FS expansion"; return 0; }
 
-# --- Ensure root is writable
+  # Ensure root is writable
   touch /tmp/.fscheck || { log "---- Root FS is read-only"; return 1; }
   rm -f /tmp/.fscheck
 
-# --- Package helpers (use tmpfs for .debs so /var doesn't fill)
+  # Package helpers (use tmpfs for .debs so /var doesn't fill)
   _apt()  { env DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives=/tmp -o APT::Keep-Downloaded-Packages=false -y "$@"; }
   _need() { command -v "$2" >/dev/null 2>&1 || { _apt update; _apt install "$1"; }; }
 
-# --- Derive disk + partition number from a block device path
+  # Derive disk + partition number from a block device path
   _derive_disk_pnum() {
     name="$(lsblk -no NAME "$1" 2>/dev/null | head -n1)"
     pnum="$(udevadm info -q property -n "$1" 2>/dev/null | sed -n 's/^ID_PART_ENTRY_NUMBER=//p')"
@@ -110,12 +110,18 @@ expand_rootfs_if_possible() {
     esac
   }
 
-# --- Grow a partition to end of disk (prefer growpart)
+  # Grow a partition to end of disk (prefer growpart)
   _grow() {
-    local d="$1" n="$2"
+    local d="$1" n="$2" out rc
     _need cloud-guest-utils growpart || true
     if command -v growpart >/dev/null 2>&1; then
-      growpart "$d" "$n"
+      { out="$(growpart "$d" "$n" 2>&1)"; rc=$?; } || true
+      if (( rc != 0 )); then
+        if grep -qi 'NOCHANGE' <<<"$out"; then
+          log "---- $d p$n already at maximum; skipping"; return 0
+        fi
+        log "growpart error: $out"; return $rc
+      fi
     else
       parted -s "$d" "resizepart $n 100%"
     fi
@@ -123,7 +129,7 @@ expand_rootfs_if_possible() {
     udevadm settle 2>/dev/null || true
   }
 
-# --- Filesystem resizer
+  # Filesystem resizer
   _resize_fs() {
     case "$fs" in
       ext2|ext3|ext4) _need e2fsprogs resize2fs; resize2fs "$src" ;;
@@ -133,15 +139,16 @@ expand_rootfs_if_possible() {
     esac
   }
 
-# --- Case 1: plain partition root
+  # Case 1: plain partition root
   if [[ "$src" =~ ^/dev/(sd[a-z][0-9]+|vd[a-z][0-9]+|xvd[a-z][0-9]+|nvme[0-9]+n[0-9]+p[0-9]+|mmcblk[0-9]+p[0-9]+)$ ]]; then
     _derive_disk_pnum "$src"
     [ -z "$pnum" ] && { log "---- Could not determine partition number for $src"; return 1; }
 
-    # **Idempotent pre-check**: skip grow if already maxed
+    # Idempotent pre-check (avoid pipefail)
     _need cloud-guest-utils growpart || true
     if command -v growpart >/dev/null 2>&1; then
-      if growpart -N "$disk" "$pnum" 2>&1 | grep -qi 'NOCHANGE'; then
+      local out; out="$(growpart -N "$disk" "$pnum" 2>&1 || true)"
+      if grep -qi 'NOCHANGE' <<<"$out"; then
         log "---- $disk p$pnum already at maximum; skipping partition resize"
       else
         _grow "$disk" "$pnum"
@@ -155,7 +162,7 @@ expand_rootfs_if_possible() {
     return 0
   fi
 
-# --- Case 2: LVM root
+  # Case 2: LVM root
   if [[ "$src" =~ ^/dev/mapper/ ]]; then
     _need lvm2 lvs || true
     lv="$(readlink -f "$src")" || return 0
@@ -165,10 +172,10 @@ expand_rootfs_if_possible() {
     if [[ -b "$pv" ]]; then
       _derive_disk_pnum "$pv"
       if [ -n "$pnum" ]; then
-        # **Idempotent pre-check** for PV partition
         _need cloud-guest-utils growpart || true
         if command -v growpart >/dev/null 2>&1; then
-          if growpart -N "$disk" "$pnum" 2>&1 | grep -qi 'NOCHANGE'; then
+          local out; out="$(growpart -N "$disk" "$pnum" 2>&1 || true)"
+          if grep -qi 'NOCHANGE' <<<"$out"; then
             log "---- $disk p$pnum already at maximum; skipping PV resize"
           else
             _grow "$disk" "$pnum"
@@ -189,7 +196,7 @@ expand_rootfs_if_possible() {
   log "---- Root FS expansion not applicable for $src"
   return 2
 }
-# --- End of Expanding rootfs ---
+# --- end of rootfs expansions ---
 
 # --- Install system deps if missing ---
 install_packages() {
