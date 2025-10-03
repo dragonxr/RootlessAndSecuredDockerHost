@@ -619,39 +619,31 @@ EOF
 # --- End of Auditd rule for docker exec calls ---
 
 # --- Install Falco via official APT repo on Debian ---
-install_falco() {
-  log "---- Installing Falco for runtime visibility"
-  if ! command -v falco &>/dev/null; then
-# --- Add apt-transport-https for older Debian versions
-    apt_retry apt install -y apt-transport-https || true
+  log "---- Installing Falco"
 
-    log "---- Import Falco GPG key"
-    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
+  export DEBIAN_FRONTEND=noninteractive
+  export FALCOCTL_ENABLED=no
 
-    log "---- Add Falco repository"
-    echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | safe_write_block /etc/apt/sources.list.d/falcosecurity.list 0644 root:root
-
-    export DEBIAN_FRONTEND=noninteractive
+  if [ -e /sys/kernel/btf/vmlinux ]; then
+    export FALCO_DRIVER_CHOICE=modern_ebpf
+    log "---- Using Falco modern eBPF (BTF detected)"
+  else
     export FALCO_DRIVER_CHOICE=ebpf
-
-    apt_retry apt update
-    apt_retry apt install -y dialog falco
-
-    log "---- Falco installed successfully"
-  else
-    log "---- Falco already installed"
+    log "BTF not detected; using classic eBPF (requires headers/toolchain)"
+    apt_retry apt-get install -y linux-headers-$(uname -r) make || {
+      log "Headers for $(uname -r) not found. If you upgraded the kernel, reboot, then rerun."
+      exit 1
+    }
   fi
 
-  log "---- Enabling and starting Falco"
+  if ! command -v falco &>/dev/null; then
+    apt_retry apt-get update
+    apt_retry apt-get install -y dialog falco
+  fi
+
   systemctl enable falco
-  systemctl restart falco
-
-  if systemctl is-active --quiet falco; then
-    log "Falco is running"
-  else
-    log "Falco failed to start; check 'journalctl -u falco'"
-    exit 1
-  fi
+  systemctl restart falco || { log "Falco failed to start"; exit 1; }
+  log "Falco is running"
 }
 # --- End of Falco Install via official APT repo on Debian ---
 
