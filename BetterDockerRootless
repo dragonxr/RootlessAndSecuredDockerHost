@@ -148,12 +148,19 @@ safe_write_block() {
   [ -L "$target" ] && { log "---- Refusing symlink: $target"; return 1; }
 
   dir="$(dirname -- "$target")"; base="$(basename -- "$target")"
-  if [ -n "$owner" ]; then
-    _u="${owner%%:*}"; _g="${owner#*:}"; [ "$_u" = "$owner" ] && _g="$_u"
-    install -d -m 0700 -o "$_u" -g "$_g" "$dir" || { log "---- Cannot create dir $dir"; return 1; }
-  else
-    install -d -m 0755 "$dir" || { log "---- Cannot create dir $dir"; return 1; }
-  fi
+ # Create parent dir only if missing; choose mode based on path so i dont break stuff again
+ if [ ! -d "$dir" ]; then
+   local dir_mode=0755
+   case "$dir" in
+     /home/*|/root/*) dir_mode=0700 ;;  # private user dirs only
+   esac
+   if [ -n "$owner" ]; then
+     _u="${owner%%:*}"; _g="${owner#*:}"; [ "$_u" = "$owner" ] && _g="$_u"
+     install -d -m "$dir_mode" -o "$_u" -g "$_g" "$dir" || { log "---- Cannot create dir $dir"; return 1; }
+   else
+     install -d -m "$dir_mode" "$dir" || { log "---- Cannot create dir $dir"; return 1; }
+   fi
+ fi
 
   exec 200>"$lock" || return 1
   flock -w 20 200 || { log "---- Lock timeout: $target"; return 1; }
