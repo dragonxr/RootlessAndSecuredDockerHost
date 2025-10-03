@@ -10,6 +10,7 @@ LOGFILE="/var/log/docker-hardening.log"
 DOCKER_USER="dockeruser"
 
 REQUIRED_PACKAGES=(
+"linux-headers-$(uname -r)"
 ca-certificates
 curl
 gnupg
@@ -28,7 +29,6 @@ fuse-overlayfs
 dbus-user-session
 openssl
 jq
-"linux-headers-$(uname -r)"
 )
 
 DOCKER_PACKAGES=(
@@ -73,7 +73,10 @@ apt_retry() {
 # --- Install system deps if missing ---
 install_packages() {
   log "---- Updating APT and installing system dependencies"
-  apt_retry apt update
+  apt_retry apt update -y
+  apt_retry apt upgrade -y
+  apt_retry apt dist-upgrade -
+y
 
   for pkg in "${REQUIRED_PACKAGES[@]}"; do
     if ! dpkg -s "$pkg" &>/dev/null; then
@@ -121,6 +124,40 @@ validate_dependencies() {
   command -v slirp4netns >/dev/null 2>&1 || { log "Missing slirp4netns"; exit 1; }
   command -v fuse-overlayfs >/dev/null 2>&1 || { log "Missing fuse-overlayfs"; exit 1; }
 }
+
+# --- Atomic write: heredoc/pipe -> file (optional MODE, OWNER:GROUP) ---
+# --- Usage because i keep forgetting and i keep causing EOF escapes
+# --- cat <<'EOF' | safe_write_block /path/to/file [0600] [user:group]
+# --- ...content that ill break ...
+# --- EOF
+
+safe_write_block() {
+  local target="$1" mode="${2:-}" owner="${3:-}" lock="${1}.lock" dir base tmp _u _g
+  [ -t 0 ] && { log "---- No stdin for $target"; return 1; }
+  [ -L "$target" ] && { log "---- Refusing symlink: $target"; return 1; }
+
+  dir="$(dirname -- "$target")"; base="$(basename -- "$target")"
+  if [ -n "$owner" ]; then
+    _u="${owner%%:*}"; _g="${owner#*:}"; [ "$_u" = "$owner" ] && _g="$_u"
+    install -d -m 0700 -o "$_u" -g "$_g" "$dir" || { log "---- Cannot create dir $dir"; return 1; }
+  else
+    install -d -m 0755 "$dir" || { log "---- Cannot create dir $dir"; return 1; }
+  fi
+
+  exec 200>"$lock" || return 1
+  flock -w 20 200 || { log "---- Lock timeout: $target"; return 1; }
+  tmp="$(mktemp --tmpdir="$dir" ".${base}.XXXXXX")" || { flock -u 200; return 1; }
+
+  cat >"$tmp" || { rm -f "$tmp"; flock -u 200; return 1; }
+  [ -n "$owner" ] && chown "$owner" "$tmp" || true
+  [ -n "$mode"  ] && chmod "$mode"  "$tmp" || true
+
+  mv -f -- "$tmp" "$target" || { rm -f "$tmp"; flock -u 200; return 1; }
+  flock -u 200
+  # Intentionally leave "$lock" to avoid races; harmless and conventional
+  log "---- Wrote $target"
+}
+
 
 # --- Create and configure non-root Docker user ---
 create_user() {
