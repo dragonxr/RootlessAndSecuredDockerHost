@@ -76,34 +76,104 @@ apt_retry() {
 }
 # --- End of Retry apt operations ---
 
-# --- Expand rootfs for VM ---
+# --- Compact root FS auto-expander (plain partitions + LVM ext4/xfs/btrfs) ---
 expand_rootfs_if_possible() {
-  local src fs disk pnum lv pv pk
-  src="$(findmnt -no SOURCE /)" || return 0
+  local src fs disk pnum lv pv name vg
+
+  # Detect root device (canonical) and filesystem
+  src="$(readlink -f "$(findmnt -no SOURCE /)")" || return 0
   fs="$(findmnt -no FSTYPE / 2>/dev/null || echo)"
 
-  _apt(){ env DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives=/tmp -o APT::Keep-Downloaded-Packages=false -y "$@"; }
-  _need(){ command -v "$2" >/dev/null 2>&1 || { _apt update; _apt install "$1"; }; }
-  _grow(){ local d="$1" n="$2"; _need cloud-guest-utils growpart || true; command -v growpart >/dev/null && growpart "$d" "$n" || parted -s "$d" "resizepart $n 100%"; partprobe "$d" || true; }
+  # Skip if running in a container
+  grep -qE '/docker|/lxc' /proc/1/cgroup && { log "---- Container detected, skipping FS expansion"; return 0; }
 
-  # Case 1: plain partition root (/dev/sda1, /dev/vda1, /dev/nvme0n1p1, …)
-  if [[ "$src" =~ ^/dev/(sd[a-z][0-9]+|vd[a-z][0-9]+|xvd[a-z][0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$ ]]; then
-    pnum="$(lsblk -no PARTNUM "$src")"; pk="$(lsblk -no PKNAME "$src")"; disk="/dev/${pk:-$(basename "${src%%[0-9]*}")}"
+  # Ensure root is writable
+  touch /tmp/.fscheck || { log "---- Root FS is read-only"; return 1; }
+  rm -f /tmp/.fscheck
+
+  # Package helpers (use tmpfs for .debs so /var doesn't fill)
+  _apt()  { env DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives=/tmp -o APT::Keep-Downloaded-Packages=false -y "$@"; }
+  _need() { command -v "$2" >/dev/null 2>&1 || { _apt update; _apt install "$1"; }; }
+
+  # Derive disk + partition number from a block device path
+  _derive_disk_pnum() {
+    # $1 = /dev/XXX
+    name="$(lsblk -no NAME "$1" 2>/dev/null | head -n1)"
+    # Try udev (most reliable when available)
+    pnum="$(udevadm info -q property -n "$1" 2>/dev/null | sed -n 's/^ID_PART_ENTRY_NUMBER=//p')"
+    if [ -n "$pnum" ]; then
+      case "$name" in
+        *p[0-9]*) disk="/dev/${name%p[0-9]*}" ;;   # nvme/mmc style
+        *)        disk="/dev/${name%%[0-9]*}" ;;   # sdX/vdX/xvdX
+      esac
+      return 0
+    fi
+    # Fallback: parse from the name
+    case "$name" in
+      *p[0-9]*) pnum="${name##*p}"; disk="/dev/${name%p[0-9]*}" ;;   # nvme0n1p3 -> disk nvme0n1, pnum 3
+      *[0-9])   pnum="${name##*[!0-9]}"; disk="/dev/${name%%[0-9]*}" ;; # sda1 -> disk sda, pnum 1
+      *)        pnum=""; disk="" ;;
+    esac
+  }
+
+  # Grow a partition to end of disk (prefer growpart)
+  _grow() {
+    local d="$1" n="$2"
+    _need cloud-guest-utils growpart || true
+    if command -v growpart >/dev/null 2>&1; then
+      growpart "$d" "$n"
+    else
+      parted -s "$d" "resizepart $n 100%"
+    fi
+    partprobe "$d" 2>/dev/null || blockdev --rereadpt "$d" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+  }
+
+  # Filesystem resizer
+  _resize_fs() {
+    case "$fs" in
+      ext2|ext3|ext4) _need e2fsprogs resize2fs; resize2fs "$src" ;;
+      xfs)            _need xfsprogs xfs_growfs; xfs_growfs / ;;
+      btrfs)          _need btrfs-progs btrfs; btrfs filesystem resize max / ;;
+      *)              log "---- FS '$fs' not handled; skipping resize" ;;
+    esac
+  }
+
+  # Case 1: plain partition root
+  if [[ "$src" =~ ^/dev/(sd[a-z][0-9]+|vd[a-z][0-9]+|xvd[a-z][0-9]+|nvme[0-9]+n[0-9]+p[0-9]+|mmcblk[0-9]+p[0-9]+)$ ]]; then
+    _derive_disk_pnum "$src"
+    [ -z "$pnum" ] && { log "---- Could not determine partition number for $src"; return 1; }
     _grow "$disk" "$pnum"
-    case "$fs" in ext2|ext3|ext4) resize2fs "$src" ;; xfs) xfs_growfs / ;; btrfs) btrfs filesystem resize max / ;; esac
-    df -h / | sed -n '1,2p'; return 0
+    _resize_fs
+    df -h / | sed -n '1,2p'
+    return 0
   fi
 
-  # Case 2: LVM root (/dev/mapper/VG-LV)
+  # Case 2: LVM root
   if [[ "$src" =~ ^/dev/mapper/ ]]; then
     _need lvm2 lvs || true
     lv="$(readlink -f "$src")" || return 0
-    pv="$(pvs --noheadings -o pv_name --select "vg_name=$(lvs --noheadings -o vg_name "$lv")" | awk 'NF{print $1;exit}')"
-    if [[ -b "$pv" ]]; then pnum="$(lsblk -no PARTNUM "$pv")"; pk="$(lsblk -no PKNAME "$pv")"; disk="/dev/$pk"; _grow "$disk" "$pnum"; pvresize "$pv" || true; fi
-    lvextend -r -l +100%FREE "$lv" 2>/dev/null || { lvextend -l +100%FREE "$lv" || true; case "$fs" in ext2|ext3|ext4) resize2fs "$src" ;; xfs) xfs_growfs / ;; btrfs) btrfs filesystem resize max / ;; esac; }
-    df -h / | sed -n '1,2p'; return 0
+    vg="$(lvs --noheadings -o vg_name "$lv" | awk 'NF{print $1;exit}')"
+    pv="$(pvs --noheadings -o pv_name --select "vg_name=$vg" | awk 'NF{print $1;exit}')"
+
+    if [[ -b "$pv" ]]; then
+      _derive_disk_pnum "$pv"
+      [ -n "$pnum" ] && { _grow "$disk" "$pnum"; pvresize "$pv" || true; }
+    fi
+
+    # Try online LV+FS grow; if -r fails, fall back to manual FS grow
+    lvextend -r -l +100%FREE "$lv" 2>/dev/null || {
+      lvextend -l +100%FREE "$lv" || true
+      _resize_fs
+    }
+    df -h / | sed -n '1,2p'
+    return 0
   fi
+
+  log "---- Root FS expansion not applicable for $src"
+  return 2
 }
+
 # --- End of Expanding rootfs ---
 
 # --- Install system deps if missing ---
