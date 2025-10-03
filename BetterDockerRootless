@@ -566,11 +566,12 @@ setup_tls() {
 
 # --- AppArmor profile for the Docker user ---
 setup_apparmor() {
-  log "---- Creating AppArmor profile for $DOCKER_USER"
-  local profile="/etc/apparmor.d/docker-${DOCKER_USER}"
-cat <<'EOF' | safe_write_block "$profile" 0644 root:root
+log "---- Creating AppArmor profile for $DOCKER_USER"
+  local profile="/etc/apparmor.d/${DOCKER_USER}"
+
+cat <<EOF | safe_write_block "$profile" 0644 root:root
 #include <tunables/global>
-profile docker-${DOCKER_USER} flags=(attach_disconnected) {
+profile ${DOCKER_USER} flags=(attach_disconnected) {
 # Basic capabilities and file read access
 # Deny reading/writing other users' home dirs or sensitive system files
 # Allow standard file usage
