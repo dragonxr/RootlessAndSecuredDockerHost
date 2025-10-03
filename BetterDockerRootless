@@ -76,6 +76,36 @@ apt_retry() {
 }
 # --- End of Retry apt operations ---
 
+# --- Expand rootfs for VM ---
+expand_rootfs_if_possible() {
+  local src fs disk pnum lv pv pk
+  src="$(findmnt -no SOURCE /)" || return 0
+  fs="$(findmnt -no FSTYPE / 2>/dev/null || echo)"
+
+  _apt(){ env DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::Archives=/tmp -o APT::Keep-Downloaded-Packages=false -y "$@"; }
+  _need(){ command -v "$2" >/dev/null 2>&1 || { _apt update; _apt install "$1"; }; }
+  _grow(){ local d="$1" n="$2"; _need cloud-guest-utils growpart || true; command -v growpart >/dev/null && growpart "$d" "$n" || parted -s "$d" "resizepart $n 100%"; partprobe "$d" || true; }
+
+  # Case 1: plain partition root (/dev/sda1, /dev/vda1, /dev/nvme0n1p1, …)
+  if [[ "$src" =~ ^/dev/(sd[a-z][0-9]+|vd[a-z][0-9]+|xvd[a-z][0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$ ]]; then
+    pnum="$(lsblk -no PARTNUM "$src")"; pk="$(lsblk -no PKNAME "$src")"; disk="/dev/${pk:-$(basename "${src%%[0-9]*}")}"
+    _grow "$disk" "$pnum"
+    case "$fs" in ext2|ext3|ext4) resize2fs "$src" ;; xfs) xfs_growfs / ;; btrfs) btrfs filesystem resize max / ;; esac
+    df -h / | sed -n '1,2p'; return 0
+  fi
+
+  # Case 2: LVM root (/dev/mapper/VG-LV)
+  if [[ "$src" =~ ^/dev/mapper/ ]]; then
+    _need lvm2 lvs || true
+    lv="$(readlink -f "$src")" || return 0
+    pv="$(pvs --noheadings -o pv_name --select "vg_name=$(lvs --noheadings -o vg_name "$lv")" | awk 'NF{print $1;exit}')"
+    if [[ -b "$pv" ]]; then pnum="$(lsblk -no PARTNUM "$pv")"; pk="$(lsblk -no PKNAME "$pv")"; disk="/dev/$pk"; _grow "$disk" "$pnum"; pvresize "$pv" || true; fi
+    lvextend -r -l +100%FREE "$lv" 2>/dev/null || { lvextend -l +100%FREE "$lv" || true; case "$fs" in ext2|ext3|ext4) resize2fs "$src" ;; xfs) xfs_growfs / ;; btrfs) btrfs filesystem resize max / ;; esac; }
+    df -h / | sed -n '1,2p'; return 0
+  fi
+}
+# --- End of Expanding rootfs ---
+
 # --- Install system deps if missing ---
 install_packages() {
   log "---- Updating APT and installing system dependencies"
@@ -772,6 +802,7 @@ final_verification() {
 main() {
 
   ensure_root
+  expand_rootfs_if_possible
   add_docker_repo
   install_packages
 
