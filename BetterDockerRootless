@@ -724,8 +724,6 @@ setup_iptables() {
 # --- Logrotate for rootless Docker logs ---
 setup_logrotate() {
   log "---- Configuring logrotate for Docker logs"
-chattr +i /var/log/auth.log
-chattr +i /var/log/syslog
 cat <<'EOF' | safe_write_block /etc/logrotate.d/docker 0644 root:root
 /home/$DOCKER_USER/.local/share/docker/containers/*/*.log {
   rotate 7
